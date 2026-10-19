@@ -2,42 +2,97 @@ from dotenv import load_dotenv
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 load_dotenv()
 
-def main():
-    print("NI HAO!")
-    info = """
-    Tywin is a tall, slender, broad-shouldered man in his fifties. His arms are thin but muscled. Tywin has kept his head shaved ever since his golden hair[10] started going bald, but he grows out bushy golden side-whiskers. Tywin has pale green eyes flecked with gold.[4][11][12][13]
+MAX_ITERATIONS = 10
+MODEL = "qwen3:1.7b"
 
-    Tywin is a calculating, intelligent, politically astute, ruthless, and controlling man.[3] He dedicates his life and efforts towards maintaining House Lannister's prestige and ensuring his family is respected, or at least feared.[14] Tywin is a proven battle commander[15] who leads from the rear,[16][17][18] and he has a powerful presence combined with an intimidating gaze.[19] He is harsh with betrayal.[20] According to his sister Genna, Tywin mistrusts laughter because of how his father, Lord Tytos, had been laughed at;[21] Grand Maester Pycelle was amazed that his late wife Joanna was able to make him laugh three different times.[3]
+@tool
+def get_product_price(product: str) -> float:
+    """Look up the price of a product in the catalog."""
+    print(f"    >> Executing get_product_price(product='{product}')")
+    prices = {"laptop": 1299.99, "headphones": 149.95, "keyboard": 89.50}
+    return prices.get(product, 0) # basically returns the value corresponding to the key (hash map/dict shenanigans)
 
-    Though ruthless, Tywin is an able and shrewd ruler who brought great prosperity during his tenure as Hand of the King to Aerys II Targaryen.[3] He is especially talented at the raising of funds, leading to a persistent jest that he must "shit gold."[11] Smallfolk also say that Tywin has a heart of old hard gold.[22] Tywin is more respected than loved in the westerlands,[23] and he is remembered in King's Landing for the Sack.[23]
 
-    Tywin considers bastards to be treacherous in nature[24] and public association with whores to be shameful to House Lannister.[22][12]
+@tool
+def apply_discount(price: float, discount_tier: str) -> float:
+    """Apply a discount tier to a price and return the final price.
+    Available tiers: bronze, silver, gold."""
+    print(f"    >> Executing apply_discount(price='{price}', discount_tier='{discount_tier}')")
+    discount_percentage = {"bronze": 5, "silver": 12, "gold": 23}
+    discount = discount_percentage.get(discount_tier, 0) # basically returns the value corresponding to the key (hash map/dict shenanigans)
+    return round(price * (1 - (discount / 100)), 2)
 
 
-    Tywin loves his elder children, Queen Cersei and Ser Jaime, but despises Tyrion. This is partly because Tyrion is a dwarf, but also Tywin blames his youngest son for causing his beloved wife Joanna's death during his birth, as well as for shaming the family name with his frequent whoring. Tywin often relies on his brother, Ser Kevan Lannister.[25][21] Ser Addam Marbrand is said to be Tywin's most daring commander.[26] Genna's husband, Ser Emmon Frey, is terrified of his brother-in-law.[27][21]
+def run_agent(question: str):
+    tools = [get_product_price, apply_discount]
+    tools_dict = {t.name: t for t in tools}
+    _llm = init_chat_model(f"ollama:{MODEL}", temperature=0)
+    llm_with_tools = _llm.bind_tools(tools)
 
-    Tywin's steel plate armor is enameled in deep crimson and highlighted with gold, and its rondels are golden sunbursts. Tywin's heavy cloth-of-gold greatcloak is clasped with gold miniature lionesses, and his greathelm is decorated with a roaring lion with ruby eyes.[16][5] He also owns a thick ermine cloak.[26] Tywin's longsword has a gold pommel.[11] His charger is a stallion[16] with its own gilded armor.[5] The destrier has a blanket with enameled crimson scales and gilded crinet and chamfron,[26] as well as crimson silk bardings decorated with the lion of the Lannisters.[5]
-    """
+    # strict rules prevent it from hallucinating
+    # VERY important when dealing with an unga bunga model
+    messages = [
+        SystemMessage(
+            "You are a helpful shopping assistant. "
+            "You have access to a product catalog tool"
+            "and a discount tool.\n\n"
+            "STRICT RULES - you must follow these exactly:\n"
+            "1. NEVER guess or assume any product price. " 
+            "You MUST call get_product_price first to get the real price.\n"
+            "2. Only call apply_discount AGTER you have received "
+            "a price from get_product_price - do NOT pass a made-up number.\n"
+            "3. NEVER calculate discounts yourself using math. "
+            "Always use the apply_discount tool.\n"
+            "4. If the user does not specify a discount tier, " 
+            "ask them which tier to use - do NOT assume one."
+        ),
+        HumanMessage(content=question)
+    ]
 
-    summary = """
-    given the information {info} about a person I want you to create:
-    1. A short summary
-    2. Two interesting facts about them
-    """
+    # keeps model thinking until MAX_ITERATIONS limit is hit
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        print(f"\n--- Iteration {iteration} ---")
 
-    summary_prompt_template = PromptTemplate(
-        input_variables=["info"], template=summary
-    )
+        # do action -> may result in a tool call
+        ai_message = llm_with_tools.invoke(messages)
+        tool_calls = ai_message.tool_calls
 
-    # llm = ChatOpenAI(temperature=0, model="gpt-5")
-    llm = ChatOllama(temperature=0,model="gemma3:270m")
-    chain = summary_prompt_template | llm
-    response = chain.invoke(input={"info": info})
-    print(response.content)
+        # if no tool calls, this is the final answer
+        if not tool_calls:
+            # this is the final answer
+            print(f"\nFinal Answer: {ai_message.content}")
+            return ai_message.content
 
+        # only process one tool per iteration
+        tool_call = tool_calls[0]
+        tool_name = tool_call.get("name")
+        tool_args = tool_call.get("args", {})
+        tool_call_id = tool_call.get("id")
+
+        print(f"    [Tool Selected] {tool_name} with args: {tool_args} & id: {tool_call_id}")
+
+        # detects invalid tool invocation 
+        tool_to_use = tools_dict.get(tool_name)
+        if tool_to_use is None:
+            raise ValueError(f"Tool '{tool_name}' not found")
+
+        # call tool -> its result is observation
+        observation = tool_to_use.invoke(tool_args)
+        print(f"    [Tool Result] {observation}")
+
+        # feedback loop -> refeed the ai_message (result of first thought iteration) + tool results (observation) into the agent message
+        messages.append(ai_message)
+        messages.append(
+            ToolMessage(content=str(observation), tool_call_id=tool_call_id)
+        )
+    
 
 if __name__ == "__main__":
-    main()
+    print("NI HAO!")
+    run_agent("What is the price of a laptop after applying a gold discount?")
